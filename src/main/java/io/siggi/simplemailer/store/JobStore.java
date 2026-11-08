@@ -192,6 +192,14 @@ public final class JobStore {
         return payloadsDir.resolve(normaliseId(id) + PAYLOAD_SUFFIX);
     }
 
+    /**
+     * {@code payloads/{uuid}.dkim}: the job's {@code DKIM-Signature} header field, computed once and sent in front
+     * of the payload on every attempt (absent when the message isn't signed).
+     */
+    public Path signatureFile(String id) {
+        return payloadsDir.resolve(normaliseId(id) + ".dkim");
+    }
+
     /** {@code payloads/{uuid}/}: directory for a job's fetched or uploaded attachments (not created here). */
     public Path payloadDir(String id) {
         return payloadsDir.resolve(normaliseId(id));

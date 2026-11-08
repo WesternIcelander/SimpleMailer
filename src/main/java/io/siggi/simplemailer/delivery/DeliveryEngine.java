@@ -1,6 +1,7 @@
 package io.siggi.simplemailer.delivery;
 
 import io.siggi.simplemailer.config.Config;
+import io.siggi.simplemailer.mime.DkimSigner;
 import io.siggi.simplemailer.model.Job;
 import io.siggi.simplemailer.model.JobStatus;
 import io.siggi.simplemailer.model.RecipientResult;
@@ -11,12 +12,16 @@ import io.siggi.simplemailer.smtp.TlsPolicy;
 import io.siggi.simplemailer.store.JobStore;
 
 import javax.net.ssl.SSLContext;
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.SequenceInputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -55,6 +60,12 @@ import java.util.logging.Logger;
  * accepts no mail, every mail exchanger rejected the session with a 5xx (greeting or {@code EHLO}), or
  * {@code requireTls} was set and every mail exchanger failed the TLS policy
  * ({@code TLS_REQUIRED_NOT_AVAILABLE} / {@code TLS_CERT_INVALID}).
+ *
+ * <p><b>DKIM</b> (PLAN.md §5): if {@link Options#dkim} has a key for the domain of the message's {@code From}
+ * header, the message is signed just before its first attempt. The {@code DKIM-Signature} header is computed once
+ * per job, saved next to the payload ({@link JobStore#signatureFile}) and sent in front of the unchanged payload on
+ * every attempt, to every domain, so retries and restarts send exactly the same bytes. A message that can't be
+ * signed is sent unsigned (and the problem logged).
  *
  * <p>Results are written to the job store as soon as each domain finishes, and the job's overall status is
  * recomputed when all its domain tasks are done. Re-running deferred jobs at their next attempt time is up to the
@@ -111,6 +122,8 @@ public final class DeliveryEngine {
         /** Context for certificate verification ({@code verifyCertificate}); {@code null} = JDK default. */
         public SSLContext verifyingContext;
         public RetryPolicy retryPolicy;
+        /** DKIM keys per signing domain; messages whose {@code From} domain has no key are sent unsigned. */
+        public DkimSigner.Keys dkim = DkimSigner.Keys.none();
         public EnvelopeSender envelopeSender = (job, r) -> job.request.from == null ? "" : job.request.from.trim();
         /** Called with the job's state after each delivery run (callbacks, retry scheduling). */
         public Consumer<Job> onRunFinished = job -> {
@@ -389,10 +402,11 @@ public final class DeliveryEngine {
      *         recipients fail permanently with the TLS error rather than being deferred)
      */
     private boolean attempt(Job job, String domain, List<Outcome> outcomes) {
-        Path message = store.payloadFile(job.id);
-        long size;
+        Path file = store.payloadFile(job.id);
+        MessageSource message;
         try {
-            size = Files.size(message);
+            byte[] signature = dkimSignature(job.id, file);
+            message = new MessageSource(signature, file, signature.length + Files.size(file));
         } catch (IOException e) {
             for (Outcome o : outcomes) {
                 o.note(null, "message file unavailable: " + e.getMessage(),
@@ -439,9 +453,9 @@ public final class DeliveryEngine {
             boolean hostOtherFailure = false;
             for (InetAddress address : addresses) {
                 if (undecided(outcomes).isEmpty()) break;
-                HostResult result = session(job, mx, address, policy, message, size, outcomes, true);
+                HostResult result = session(job, mx, address, policy, message, outcomes, true);
                 if (result == HostResult.RETRY_PLAINTEXT) {
-                    result = session(job, mx, address, policy, message, size, outcomes, false);
+                    result = session(job, mx, address, policy, message, outcomes, false);
                 }
                 if (result == HostResult.TLS_POLICY_FAILED) hostTlsFailure = true;
                 else if (result != HostResult.DONE) hostOtherFailure = true;
@@ -466,8 +480,8 @@ public final class DeliveryEngine {
     }
 
     /** One SMTP connection: greeting, EHLO, STARTTLS, then one transaction per distinct reverse path. */
-    private HostResult session(Job job, MxResolver.MxHost mx, InetAddress address, TlsPolicy policy, Path message,
-                               long size, List<Outcome> outcomes, boolean useTls) {
+    private HostResult session(Job job, MxResolver.MxHost mx, InetAddress address, TlsPolicy policy,
+                               MessageSource message, List<Outcome> outcomes, boolean useTls) {
         String host = mx.host();
         InetSocketAddress endpoint = options.endpoints.endpoint(mx, address);
         SmtpClient client;
@@ -522,7 +536,7 @@ public final class DeliveryEngine {
                     }
                 }
                 first = false;
-                transaction(client, host, tls, e.getKey(), e.getValue(), message, size);
+                transaction(client, host, tls, e.getKey(), e.getValue(), message);
             }
             return HostResult.DONE;
         } catch (IOException e) {
@@ -537,8 +551,8 @@ public final class DeliveryEngine {
 
     /** {@code MAIL}, {@code RCPT} per recipient, {@code DATA}. Decides outcomes on 2xx/5xx; 4xx leaves them open. */
     private void transaction(SmtpClient client, String host, boolean tls, String reversePath, List<Outcome> group,
-                             Path message, long size) throws IOException {
-        SmtpResponse mail = client.mail(reversePath, size);
+                             MessageSource message) throws IOException {
+        SmtpResponse mail = client.mail(reversePath, message.size());
         if (!mail.isPositive()) {
             for (Outcome o : group) decide(o, host, mail, ResultClassifier.Phase.MAIL, tls);
             return;
@@ -551,10 +565,59 @@ public final class DeliveryEngine {
         }
         if (accepted.isEmpty()) return;
         SmtpResponse data;
-        try (InputStream in = Files.newInputStream(message)) {
+        try (InputStream in = message.open()) {
             data = client.data(in);
         }
         for (Outcome o : accepted) decide(o, host, data, ResultClassifier.Phase.DATA, tls);
+    }
+
+    // ---- DKIM ---------------------------------------------------------------------------------------------------
+
+    /** The bytes sent as the message: the DKIM-Signature header (possibly empty) followed by the payload file. */
+    private record MessageSource(byte[] signature, Path file, long size) {
+        InputStream open() throws IOException {
+            InputStream payload = Files.newInputStream(file);
+            return signature.length == 0 ? payload
+                    : new SequenceInputStream(new ByteArrayInputStream(signature), payload);
+        }
+    }
+
+    /**
+     * The job's {@code DKIM-Signature} header field (ending in CRLF), or an empty array if the message isn't signed.
+     * Computed once per job under the job's lock and saved, so concurrent domain tasks, retries and restarts all use
+     * the same signature.
+     *
+     * @throws IOException only if the payload file can't be read (the message can't be sent at all)
+     */
+    private byte[] dkimSignature(String id, Path payload) throws IOException {
+        Path saved = store.signatureFile(id);
+        return store.withLock(id, () -> {
+            try {
+                return Files.readAllBytes(saved);
+            } catch (NoSuchFileException e) {
+                // not signed yet
+            }
+            if (!Files.isRegularFile(payload)) throw new NoSuchFileException(payload.toString());
+            if (options.dkim.domains().isEmpty()) return new byte[0];
+            DkimSigner signer;
+            String header;
+            try {
+                String domain = DkimSigner.fromDomain(payload);
+                signer = options.dkim.forDomain(domain);
+                if (signer == null) return new byte[0];
+                header = signer.sign(payload);
+            } catch (IOException | RuntimeException e) {
+                LOG.log(Level.WARNING, "could not DKIM-sign job " + id + "; sending it unsigned", e);
+                return new byte[0];
+            }
+            byte[] bytes = header.getBytes(StandardCharsets.ISO_8859_1);
+            try {
+                JobStore.writeAtomic(saved, bytes);
+            } catch (IOException e) {
+                LOG.log(Level.WARNING, "could not save DKIM signature of job " + id, e);
+            }
+            return bytes;
+        });
     }
 
     /** Applies the {@link ResultClassifier} verdict: delivered, failed, or left open (next MX / deferred). */

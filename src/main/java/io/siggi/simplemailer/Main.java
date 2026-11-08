@@ -15,6 +15,7 @@ import io.siggi.simplemailer.inbound.BounceProcessor;
 import io.siggi.simplemailer.inbound.InboundSmtpServer;
 import io.siggi.simplemailer.inbound.VerpAddress;
 import io.siggi.simplemailer.mime.AttachmentFetcher;
+import io.siggi.simplemailer.mime.DkimSigner;
 import io.siggi.simplemailer.mime.JobPreparer;
 import io.siggi.simplemailer.model.Job;
 import io.siggi.simplemailer.model.JobStatus;
@@ -65,6 +66,8 @@ public final class Main implements AutoCloseable {
         this.retryScheduler = new RetryScheduler(config, this::submitRetry);
         DeliveryEngine.Options deliveryOptions = new DeliveryEngine.Options();
         deliveryOptions.retryPolicy = retryScheduler;
+        // DKIM keys per From domain (PLAN.md §5, §7); an unreadable or invalid key file stops startup
+        deliveryOptions.dkim = DkimSigner.Keys.load(config.dkim);
         deliveryOptions.onRunFinished = job -> {
             retryScheduler.onRunFinished(job);
             callbackDispatcher.onJobChanged(job);

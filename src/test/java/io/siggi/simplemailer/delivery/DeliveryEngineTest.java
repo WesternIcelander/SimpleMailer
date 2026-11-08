@@ -1,6 +1,7 @@
 package io.siggi.simplemailer.delivery;
 
 import io.siggi.simplemailer.config.Config;
+import io.siggi.simplemailer.mime.DkimSigner;
 import io.siggi.simplemailer.model.Job;
 import io.siggi.simplemailer.model.JobStatus;
 import io.siggi.simplemailer.model.RecipientResult;
@@ -23,7 +24,12 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.time.Clock;
+import java.time.ZoneOffset;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -37,7 +43,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -52,6 +60,9 @@ class DeliveryEngineTest {
     private static final String TLS_MX = "mx.tls.test";
     /** Context the engine uses for {@code verifyCertificate}; {@code null} = JDK default trust store. */
     private SSLContext verifyingContext;
+    /** DKIM keys the engine signs with. */
+    private DkimSigner.Keys dkim = DkimSigner.Keys.none();
+    private static KeyPair dkimKeys;
 
     private JobStore store;
     private ExecutorService executor;
@@ -64,6 +75,9 @@ class DeliveryEngineTest {
     @BeforeAll
     static void createCertificate() throws Exception {
         cert = TestCertificate.create(certDir, TLS_MX);
+        KeyPairGenerator g = KeyPairGenerator.getInstance("RSA");
+        g.initialize(2048);
+        dkimKeys = g.generateKeyPair();
     }
 
     @BeforeEach
@@ -115,6 +129,7 @@ class DeliveryEngineTest {
             return e;
         };
         options.verifyingContext = verifyingContext;
+        options.dkim = dkim;
         if (envelopeSender != null) options.envelopeSender = envelopeSender;
         return new DeliveryEngine(config, store, resolver(), executor, options);
     }
@@ -124,6 +139,11 @@ class DeliveryEngineTest {
     }
 
     private String createJob(boolean requireTls, boolean verifyCertificate, String... recipients) throws Exception {
+        return createJobWithPayload(requireTls, verifyCertificate, "Subject: Hello\r\n\r\nHi there\r\n", recipients);
+    }
+
+    private String createJobWithPayload(boolean requireTls, boolean verifyCertificate, String payload, String... recipients)
+            throws Exception {
         SendRequest send = new SendRequest();
         send.requireTls = requireTls;
         send.verifyCertificate = verifyCertificate;
@@ -134,7 +154,7 @@ class DeliveryEngineTest {
         send.text = "Hi there";
         assertTrue(send.validate().isEmpty(), send.validate().toString());
         store.create(send.id, JobStore.payloadHash(send), () -> {
-            store.writePayload(send.id, "Subject: Hello\r\n\r\nHi there\r\n".getBytes(StandardCharsets.UTF_8));
+            store.writePayload(send.id, payload.getBytes(StandardCharsets.UTF_8));
             return Job.create(send, "x", Instant.now(), JobStatus.QUEUED);
         });
         return send.id;
@@ -894,6 +914,111 @@ class DeliveryEngineTest {
         assertEquals(RecipientResult.Status.DELIVERED, ok.recipients.get(0).status);
         assertEquals(Boolean.FALSE, ok.recipients.get(0).tls);
         assertEquals(1, s.messages.size());
+    }
+
+    // ---- DKIM ---------------------------------------------------------------------------------------------------
+
+    private static final String SIGNED_PAYLOAD = "From: \"Sender, Inc.\" <sender@Example.com>\r\n"
+            + "To: a@one.test\r\nSubject: Hello\r\nMessage-ID: <x@example.com>\r\n\r\nHi there\r\n";
+
+    /** A clock that tests can move forward. */
+    private static final class MutableClock extends Clock {
+        volatile Instant now = Instant.ofEpochSecond(1700000000L);
+
+        @Override
+        public java.time.ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(java.time.ZoneId zone) {
+            return this;
+        }
+
+        @Override
+        public Instant instant() {
+            return now;
+        }
+    }
+
+    @Test
+    void signsWithTheKeyOfTheFromDomainOncePerJob() throws Exception {
+        MutableClock clock = new MutableClock();
+        DkimSigner signer = new DkimSigner("example.com", "sel1", dkimKeys.getPrivate(), clock);
+        dkim = new DkimSigner.Keys(Map.of("example.com", signer,
+                "other.test", new DkimSigner("other.test", "s", dkimKeys.getPrivate(), clock)));
+        mxRecords.put("one.test", List.of("10 mx.one.test"));
+        mxRecords.put("two.test", List.of("10 mx.two.test"));
+        FakeSmtpServer one = server("mx.one.test");
+        FakeSmtpServer two = server("mx.two.test");
+        String id = createJobWithPayload(false, false, SIGNED_PAYLOAD, "a@one.test", "b@two.test");
+        String expectedHeader = signer.sign(SIGNED_PAYLOAD.getBytes(StandardCharsets.UTF_8));
+
+        Job job = engine(10).deliver(id).orElseThrow();
+
+        assertEquals(JobStatus.DELIVERED, job.status);
+        String sent = new String(one.messages.get(0), StandardCharsets.UTF_8);
+        assertTrue(sent.startsWith("DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.com; s=sel1;"),
+                sent);
+        // the signature header is prepended to the unchanged message, the same bytes for every domain
+        assertEquals(expectedHeader + SIGNED_PAYLOAD, sent);
+        assertArrayEquals(one.messages.get(0), two.messages.get(0));
+        assertEquals(expectedHeader, Files.readString(store.signatureFile(id)));
+        // SIZE covers the signature too
+        long size = one.messages.get(0).length;
+        assertTrue(one.commands.stream().anyMatch(c -> c.startsWith("MAIL FROM:") && c.contains("SIZE=" + size)),
+                one.commands.toString());
+    }
+
+    @Test
+    void retriesSendTheSameSignature() throws Exception {
+        MutableClock clock = new MutableClock();
+        dkim = new DkimSigner.Keys(Map.of("example.com",
+                new DkimSigner("example.com", "sel1", dkimKeys.getPrivate(), clock)));
+        mxRecords.put("one.test", List.of("10 mx.one.test"));
+        FakeSmtpServer one = server("mx.one.test");
+        one.dataReply = "451 4.3.0 try later\r\n";
+        String id = createJobWithPayload(false, false, SIGNED_PAYLOAD, "a@one.test");
+        DeliveryEngine engine = engine(10);
+
+        assertEquals(RecipientResult.Status.DEFERRED, engine.deliver(id).orElseThrow().recipients.get(0).status);
+        String firstHeader = Files.readString(store.signatureFile(id));
+        assertTrue(firstHeader.contains("t=1700000000;"), firstHeader);
+
+        clock.now = clock.now.plusSeconds(3600); // a re-signed header would differ (t=)
+        one.dataReply = "250 2.0.0 queued\r\n";
+        store.update(id, job -> job.recipients.get(0).nextAttemptAt = Instant.now().minusSeconds(1));
+        assertEquals(JobStatus.DELIVERED, engine(10).deliver(id).orElseThrow().status);
+
+        assertEquals(2, one.messages.size());
+        assertArrayEquals(one.messages.get(0), one.messages.get(1));
+        assertEquals(firstHeader + SIGNED_PAYLOAD, new String(one.messages.get(1), StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void messageIsSentUnsignedWithoutAKeyForItsFromDomain() throws Exception {
+        dkim = new DkimSigner.Keys(Map.of("other.test",
+                new DkimSigner("other.test", "s", dkimKeys.getPrivate())));
+        mxRecords.put("one.test", List.of("10 mx.one.test"));
+        FakeSmtpServer one = server("mx.one.test");
+        String id = createJobWithPayload(false, false, SIGNED_PAYLOAD, "a@one.test");
+
+        assertEquals(JobStatus.DELIVERED, engine(10).deliver(id).orElseThrow().status);
+
+        assertEquals(SIGNED_PAYLOAD, new String(one.messages.get(0), StandardCharsets.UTF_8));
+        assertFalse(Files.exists(store.signatureFile(id)));
+    }
+
+    @Test
+    void messageWithoutFromHeaderIsSentUnsigned() throws Exception {
+        dkim = new DkimSigner.Keys(Map.of("example.com",
+                new DkimSigner("example.com", "sel1", dkimKeys.getPrivate())));
+        mxRecords.put("one.test", List.of("10 mx.one.test"));
+        FakeSmtpServer one = server("mx.one.test");
+        String id = createJob("a@one.test"); // payload has no From header
+
+        assertEquals(JobStatus.DELIVERED, engine(10).deliver(id).orElseThrow().status);
+        assertEquals("Subject: Hello\r\n\r\nHi there\r\n", new String(one.messages.get(0), StandardCharsets.UTF_8));
     }
 
     private static int indexOfPrefix(FakeSmtpServer s, String prefix) {
