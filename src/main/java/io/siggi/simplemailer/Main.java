@@ -7,10 +7,13 @@ import io.siggi.simplemailer.api.Auth;
 import io.siggi.simplemailer.api.MessagesResponder;
 import io.siggi.simplemailer.api.StatusResponder;
 import io.siggi.simplemailer.config.Config;
+import io.siggi.simplemailer.delivery.DeliveryEngine;
+import io.siggi.simplemailer.delivery.RetryScheduler;
 import io.siggi.simplemailer.mime.AttachmentFetcher;
 import io.siggi.simplemailer.mime.JobPreparer;
 import io.siggi.simplemailer.model.Job;
 import io.siggi.simplemailer.model.JobStatus;
+import io.siggi.simplemailer.smtp.MxResolver;
 import io.siggi.simplemailer.store.JobStore;
 import io.siggi.tools.io.ServerSocketHandler;
 
@@ -38,6 +41,8 @@ public final class Main implements AutoCloseable {
     private final Auth auth;
     private final JobStore store;
     private final JobPreparer preparer;
+    private final DeliveryEngine deliveryEngine;
+    private final RetryScheduler retryScheduler;
 
     private Main(Config config, ServerSocket serverSocket) throws IOException {
         this.config = config;
@@ -45,6 +50,13 @@ public final class Main implements AutoCloseable {
         this.executor = Executors.newVirtualThreadPerTaskExecutor();
         this.auth = Auth.fromConfig(config);
         this.store = new JobStore(Path.of(config.dataDir));
+        // deferred recipients are re-run by the retry scheduler at their nextAttemptAt
+        this.retryScheduler = new RetryScheduler(config, this::submitRetry);
+        DeliveryEngine.Options deliveryOptions = new DeliveryEngine.Options();
+        deliveryOptions.retryPolicy = retryScheduler;
+        deliveryOptions.onRunFinished = retryScheduler::onRunFinished;
+        this.deliveryEngine = new DeliveryEngine(config, store, MxResolver.system(), executor, deliveryOptions);
+        this.deliveryQueue = deliveryEngine::submit;
         this.preparer = new JobPreparer(config, store, AttachmentFetcher.fromConfig(config), executor,
                 this::enqueue, job -> {
                     // the callback dispatcher (a later step) will report ATTACHMENT_FETCH_FAILED here
@@ -94,6 +106,7 @@ public final class Main implements AutoCloseable {
         }
         main.listen();
         main.executor.execute(main::resumePreparing);
+        main.executor.execute(main::resumeDelivery);
         return main;
     }
 
@@ -132,13 +145,12 @@ public final class Main implements AutoCloseable {
         return store;
     }
 
-    private volatile Consumer<Job> deliveryQueue = job -> {
-    };
+    private volatile Consumer<Job> deliveryQueue;
     private volatile Consumer<Job> preparationQueue;
 
     /**
-     * Sets where queued jobs are handed for delivery (the delivery engine arrives in a later step): new jobs without
-     * URL attachments, and {@code preparing} jobs once their attachments are fetched.
+     * Replaces where queued jobs are handed for delivery (by default the {@link DeliveryEngine}): new jobs without
+     * URL attachments, and {@code preparing} jobs once their attachments are fetched. For tests.
      */
     public void setDeliveryQueue(Consumer<Job> queue) {
         this.deliveryQueue = queue;
@@ -147,6 +159,18 @@ public final class Main implements AutoCloseable {
     /** Replaces where new {@code preparing} jobs are handed (by default the {@link JobPreparer}); for tests. */
     public void setPreparationQueue(Consumer<Job> queue) {
         this.preparationQueue = queue;
+    }
+
+    public DeliveryEngine deliveryEngine() {
+        return deliveryEngine;
+    }
+
+    private boolean submitRetry(Job job) {
+        return deliveryEngine.submit(job);
+    }
+
+    public RetryScheduler retryScheduler() {
+        return retryScheduler;
     }
 
     public JobPreparer preparer() {
@@ -177,6 +201,18 @@ public final class Main implements AutoCloseable {
         }
     }
 
+    /**
+     * Startup: jobs left {@code queued}, {@code sending} or {@code deferred} by a restart are re-enqueued; only their
+     * unfinished recipients are attempted, and deferred ones keep their retry time (PLAN.md §4).
+     */
+    private void resumeDelivery() {
+        try {
+            deliveryEngine.resumeAll(retryScheduler::schedule);
+        } catch (IOException e) {
+            System.err.println("Could not resume unfinished deliveries: " + e);
+        }
+    }
+
     /** {@code GET /health}: unauthenticated liveness check. */
     private static void health(HTTPRequest request) throws Exception {
         if (!request.method.equals("GET")) {
@@ -202,6 +238,7 @@ public final class Main implements AutoCloseable {
         try {
             serverSocket.close();
         } finally {
+            retryScheduler.close();
             executor.shutdownNow();
         }
     }

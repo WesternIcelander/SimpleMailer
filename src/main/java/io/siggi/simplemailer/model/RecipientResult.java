@@ -36,6 +36,8 @@ public final class RecipientResult {
     /** MX host used for the last attempt. */
     public String mx;
     public Integer smtpCode;
+    /** RFC 3463 enhanced status code of the last reply (e.g. {@code 5.1.1}), if the server sent one. */
+    public String enhancedStatus;
     public String smtpMessage;
     /** Machine-readable error such as {@code TLS_REQUIRED_NOT_AVAILABLE} or {@code TLS_CERT_INVALID}. */
     public String error;
