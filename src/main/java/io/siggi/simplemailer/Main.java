@@ -4,12 +4,16 @@ import io.siggi.http.HTTPRequest;
 import io.siggi.http.HTTPServer;
 import io.siggi.http.HTTPServerBuilder;
 import io.siggi.simplemailer.api.Auth;
+import io.siggi.simplemailer.api.BounceResponder;
 import io.siggi.simplemailer.api.MessagesResponder;
 import io.siggi.simplemailer.api.StatusResponder;
 import io.siggi.simplemailer.callback.CallbackDispatcher;
 import io.siggi.simplemailer.config.Config;
 import io.siggi.simplemailer.delivery.DeliveryEngine;
 import io.siggi.simplemailer.delivery.RetryScheduler;
+import io.siggi.simplemailer.inbound.BounceProcessor;
+import io.siggi.simplemailer.inbound.InboundSmtpServer;
+import io.siggi.simplemailer.inbound.VerpAddress;
 import io.siggi.simplemailer.mime.AttachmentFetcher;
 import io.siggi.simplemailer.mime.JobPreparer;
 import io.siggi.simplemailer.model.Job;
@@ -45,6 +49,10 @@ public final class Main implements AutoCloseable {
     private final DeliveryEngine deliveryEngine;
     private final RetryScheduler retryScheduler;
     private final CallbackDispatcher callbackDispatcher;
+    /** Shared by both bounce intakes; null when {@code bounces.domain}/{@code bounces.secret} aren't set. */
+    private final BounceProcessor bounceProcessor;
+    /** The SMTP bounce listener; null unless {@code bounces.intake} includes {@code smtp}. */
+    private volatile InboundSmtpServer inboundSmtpServer;
 
     private Main(Config config, ServerSocket serverSocket) throws IOException {
         this.config = config;
@@ -61,6 +69,12 @@ public final class Main implements AutoCloseable {
             retryScheduler.onRunFinished(job);
             callbackDispatcher.onJobChanged(job);
         };
+        // MAIL FROM is the recipient's VERP bounce address whenever bounces.domain/secret are set (PLAN.md §6a),
+        // even with bounce intake disabled, so intake can be enabled later
+        VerpAddress verp = VerpAddress.fromConfig(config);
+        if (verp != null) deliveryOptions.envelopeSender = verp.envelopeSender();
+        this.bounceProcessor = verp == null ? null
+                : new BounceProcessor(Path.of(config.dataDir), store, verp, callbackDispatcher);
         this.deliveryEngine = new DeliveryEngine(config, store, MxResolver.system(), executor, deliveryOptions);
         this.deliveryQueue = deliveryEngine::submit;
         this.preparer = new JobPreparer(config, store, AttachmentFetcher.fromConfig(config), executor,
@@ -85,12 +99,24 @@ public final class Main implements AutoCloseable {
                 auth.protect(Auth.Scope.SENDER, new MessagesResponder(config, store, this::acceptJob)));
         httpServer.responderRegistry.register(StatusResponder.PREFIX,
                 auth.protect(Auth.Scope.SENDER, new StatusResponder(config, store)));
+        // POST /v1/bounces exists only with the api bounce intake (PLAN.md §6a); bounce keys only
+        if (config.bounces.apiIntake()) {
+            if (bounceProcessor == null) {
+                throw new IllegalStateException("API bounce intake needs bounces.domain and bounces.secret");
+            }
+            httpServer.responderRegistry.register(BounceResponder.PATH, auth.protect(Auth.Scope.BOUNCE,
+                    new BounceResponder(bounceProcessor, config.bounces.smtpMaxMessageBytes)));
+        }
     }
 
     public static void main(String[] args) throws Exception {
         Config config = Config.load();
         Main main = start(config);
         System.out.println("SimpleMailer listening on " + config.bindAddress + ":" + main.port());
+        if (main.inboundSmtpServer() != null) {
+            System.out.println("SMTP bounce intake listening on " + config.bindAddress + ":"
+                    + main.inboundSmtpServer().port());
+        }
     }
 
     /** Binds {@code config.bindAddress:config.listenPort} and starts serving. */
@@ -101,14 +127,44 @@ public final class Main implements AutoCloseable {
 
     /** Starts serving on an already bound socket (used by tests to listen on an ephemeral port). */
     public static Main start(Config config, ServerSocket serverSocket) throws IOException {
+        ServerSocket smtpSocket = null;
+        if (config.bounces.smtpIntake()) {
+            try {
+                smtpSocket = new ServerSocket(config.bounces.smtpPort, BACKLOG,
+                        InetAddress.getByName(config.bindAddress));
+            } catch (IOException | RuntimeException e) {
+                serverSocket.close();
+                throw e;
+            }
+        }
+        return start(config, serverSocket, smtpSocket);
+    }
+
+    /**
+     * Starts serving on already bound sockets; {@code smtpSocket} is used for the SMTP bounce intake when
+     * {@code bounces.intake} includes {@code smtp} (otherwise it must be null). Used by tests.
+     */
+    public static Main start(Config config, ServerSocket serverSocket, ServerSocket smtpSocket) throws IOException {
         Main main;
         try {
             main = new Main(config, serverSocket);
+            if (config.bounces.smtpIntake()) {
+                if (smtpSocket == null) throw new IllegalArgumentException("SMTP bounce intake needs a socket");
+                if (main.bounceProcessor == null) {
+                    throw new IllegalStateException("SMTP bounce intake needs bounces.domain and bounces.secret");
+                }
+                main.inboundSmtpServer = new InboundSmtpServer(main.bounceProcessor,
+                        InboundSmtpServer.Options.fromConfig(config));
+            } else if (smtpSocket != null) {
+                throw new IllegalArgumentException("SMTP bounce intake is not enabled");
+            }
         } catch (IOException | RuntimeException e) {
             serverSocket.close();
+            if (smtpSocket != null) smtpSocket.close();
             throw e;
         }
         main.listen();
+        if (main.inboundSmtpServer != null) main.inboundSmtpServer.start(smtpSocket);
         main.executor.execute(main::resumePreparing);
         main.executor.execute(main::resumeDelivery);
         main.executor.execute(main::resumeCallbacks);
@@ -180,6 +236,16 @@ public final class Main implements AutoCloseable {
 
     public CallbackDispatcher callbackDispatcher() {
         return callbackDispatcher;
+    }
+
+    /** The bounce processor, or null when no bounce domain and secret are configured. */
+    public BounceProcessor bounceProcessor() {
+        return bounceProcessor;
+    }
+
+    /** The SMTP bounce listener, or null when the {@code smtp} intake is disabled. */
+    public InboundSmtpServer inboundSmtpServer() {
+        return inboundSmtpServer;
     }
 
     public JobPreparer preparer() {
@@ -255,6 +321,8 @@ public final class Main implements AutoCloseable {
     public void close() throws IOException {
         try {
             serverSocket.close();
+            InboundSmtpServer smtp = inboundSmtpServer;
+            if (smtp != null) smtp.close();
         } finally {
             retryScheduler.close();
             callbackDispatcher.close();

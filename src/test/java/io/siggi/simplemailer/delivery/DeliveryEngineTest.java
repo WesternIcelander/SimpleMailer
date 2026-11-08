@@ -5,6 +5,7 @@ import io.siggi.simplemailer.model.Job;
 import io.siggi.simplemailer.model.JobStatus;
 import io.siggi.simplemailer.model.RecipientResult;
 import io.siggi.simplemailer.model.SendRequest;
+import io.siggi.simplemailer.inbound.VerpAddress;
 import io.siggi.simplemailer.smtp.FakeSmtpServer;
 import io.siggi.simplemailer.smtp.MxResolver;
 import io.siggi.simplemailer.smtp.TestCertificate;
@@ -100,6 +101,10 @@ class DeliveryEngineTest {
     }
 
     private DeliveryEngine engine(int maxConcurrent) throws Exception {
+        return engine(maxConcurrent, null);
+    }
+
+    private DeliveryEngine engine(int maxConcurrent, DeliveryEngine.EnvelopeSender envelopeSender) throws Exception {
         Config config = Config.fromJson("{\"heloName\": \"sender.example.com\", \"connectTimeout\": \"2s\","
                 + " \"readTimeout\": \"5s\", \"maxConcurrentDeliveries\": " + maxConcurrent
                 + ", \"retrySchedule\": [\"1m\", \"5m\"]}");
@@ -110,6 +115,7 @@ class DeliveryEngineTest {
             return e;
         };
         options.verifyingContext = verifyingContext;
+        if (envelopeSender != null) options.envelopeSender = envelopeSender;
         return new DeliveryEngine(config, store, resolver(), executor, options);
     }
 
@@ -168,6 +174,30 @@ class DeliveryEngineTest {
         assertEquals("Subject: Hello\r\n\r\nHi there\r\n", new String(one.messages.get(0), StandardCharsets.UTF_8));
         // persisted
         assertEquals(JobStatus.DELIVERED, store.get(id).orElseThrow().status);
+    }
+
+    @Test
+    void verpMailFromIsPerRecipient() throws Exception {
+        mxRecords.put("one.test", List.of("10 mx.one.test"));
+        FakeSmtpServer one = server("mx.one.test");
+        String id = createJob("a@one.test", "c@one.test");
+        VerpAddress verp = new VerpAddress("bounces.example.com", "secret");
+
+        Job job = engine(10, verp.envelopeSender()).deliver(id).orElseThrow();
+
+        assertEquals(JobStatus.DELIVERED, job.status);
+        // each recipient has its own reverse path, so each gets its own transaction
+        assertEquals(2, one.messages.size());
+        List<String> mailFroms = one.commands.stream().filter(c -> c.startsWith("MAIL FROM:")).toList();
+        assertEquals(2, mailFroms.size());
+        for (int i = 0; i < 2; i++) {
+            String address = verp.encode(id, i);
+            assertTrue(mailFroms.stream().anyMatch(c -> c.startsWith("MAIL FROM:<" + address + ">")), mailFroms.toString());
+            VerpAddress.Verification v = verp.verify(address);
+            assertTrue(v.valid());
+            assertEquals(id, v.address().jobId());
+            assertEquals(i, v.address().recipientIndex());
+        }
     }
 
     @Test

@@ -57,9 +57,20 @@ public final class Job {
         public String action;
         public String status;
         public String diagnostic;
+        /**
+         * What was received: {@code dsn}, {@code non_dsn_bounce}, {@code report} (pre-parsed API form),
+         * {@code auto_reply} or {@code not_bounce} (the last two are recorded but ignored).
+         */
+        public String kind;
+        /** True if the message didn't change the recipient's status (auto-reply, not a bounce, delayed, ...). */
+        public boolean ignored;
+        /** {@code Final-Recipient} from the DSN, when it differs from {@link #recipient} (e.g. after forwarding). */
+        public String finalRecipient;
         /** DSN {@code Message-ID} or content hash, for duplicate detection. */
         public String dedupeKey;
-        /** Path of the stored raw bounce, if any. */
+        /** SHA-256 (hex) of the raw bounce (or of the pre-parsed report), for duplicate detection. */
+        public String contentHash;
+        /** Path of the stored raw bounce relative to the data directory, if any. */
         public String file;
     }
 

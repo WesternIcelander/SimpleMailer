@@ -92,6 +92,15 @@ public final class Config {
         public int smtpPort = 25;
         public String smtpTlsCert = null;
         public String smtpTlsKey = null;
+        /** Largest bounce message the SMTP intake (advertised as {@code SIZE}) and {@code POST /v1/bounces} accept. */
+        public long smtpMaxMessageBytes = 10L * 1024 * 1024;
+        /** Simultaneous SMTP intake connections, in total and from one client address. */
+        public int smtpMaxConnections = 100;
+        public int smtpMaxConnectionsPerIp = 10;
+        /** How long the SMTP intake waits for the next command or line of data. */
+        public Duration smtpIdleTimeout = Duration.ofMinutes(5);
+        /** Hard limit on the length of one SMTP intake connection. */
+        public Duration smtpSessionTimeout = Duration.ofMinutes(30);
         public List<String> apiKeys = new ArrayList<>();
 
         public boolean smtpIntake() {
@@ -231,6 +240,11 @@ public final class Config {
             errors.add("bounces.smtpTlsCert and bounces.smtpTlsKey must be set together");
         }
         if (bounces.apiKeys.stream().anyMatch(Config::isBlank)) errors.add("bounces.apiKeys must not contain blank keys");
+        if (bounces.smtpMaxMessageBytes <= 0) errors.add("bounces.smtpMaxMessageBytes must be positive");
+        if (bounces.smtpMaxConnections <= 0) errors.add("bounces.smtpMaxConnections must be positive");
+        if (bounces.smtpMaxConnectionsPerIp <= 0) errors.add("bounces.smtpMaxConnectionsPerIp must be positive");
+        requirePositive(errors, "bounces.smtpIdleTimeout", bounces.smtpIdleTimeout);
+        requirePositive(errors, "bounces.smtpSessionTimeout", bounces.smtpSessionTimeout);
         if (!bounces.intake.isEmpty()) {
             if (isBlank(bounces.domain)) errors.add("bounces.domain is required when bounce intake is enabled");
             if (isBlank(bounces.secret)) errors.add("bounces.secret is required when bounce intake is enabled");
