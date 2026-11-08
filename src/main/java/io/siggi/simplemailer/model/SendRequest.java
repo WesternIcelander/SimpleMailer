@@ -7,7 +7,10 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.UUID;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
@@ -15,7 +18,8 @@ import java.util.regex.Pattern;
  *
  * <p>Either structured ({@code subject}/{@code text}/{@code html}, envelope = {@code to ∪ cc ∪ bcc}) or {@code raw}
  * (envelope = {@code recipients}). {@link #validate()} checks the rules that don't need configuration or uploaded
- * files; size limits and {@code cid:} matching are checked where that information is available.
+ * files, including that every {@code cid:} URL in {@code html} names an inline attachment; size limits and upload
+ * matching are checked where that information is available.
  */
 public final class SendRequest {
     public String id;
@@ -63,6 +67,13 @@ public final class SendRequest {
                     + "|\\[[0-9A-Fa-f:.]+])$");
     private static final Pattern UUID_PATTERN = Pattern.compile(
             "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$");
+    /**
+     * A {@code cid:} URL used as an attribute value ({@code src="cid:…"}, {@code href=cid:…}) or a CSS
+     * {@code url(cid:…)}. Group 1 is the (still percent-encoded) Content-ID. Plain text that merely mentions
+     * "cid:" is not matched.
+     */
+    private static final Pattern CID_REFERENCE = Pattern.compile(
+            "(?:=\\s*[\"']?|url\\(\\s*[\"']?)cid:([^\"'\\s<>)]*)", Pattern.CASE_INSENSITIVE);
     private static final Pattern HEADER_NAME = Pattern.compile("^[!-9;-~]+$");
     /** Headers the server writes itself; callers can't override them through {@code headers}. */
     private static final Set<String> RESERVED_HEADERS = Set.of(
@@ -157,6 +168,7 @@ public final class SendRequest {
             checkAddresses(errors, "bcc", bcc);
             checkHeaders(errors);
             checkAttachments(errors);
+            checkCidReferences(errors);
         }
 
         if (from == null || from.isBlank()) {
@@ -220,10 +232,78 @@ public final class SendRequest {
             if (a.filename == null || a.filename.isBlank()) errors.add(where + ": filename is required");
             if (a.inline) {
                 String cid = a.effectiveCid();
-                if (cid != null && !cid.isBlank() && !cids.add(cid)) {
-                    errors.add(where + ": duplicate inline cid '" + cid + "'");
+                if (cid != null && !cid.isBlank()) {
+                    if (!isValidCid(cid)) {
+                        errors.add(where + ": cid '" + cid + "' must not contain '<', '>' or control characters");
+                    } else if (!cids.add(cid)) {
+                        errors.add(where + ": duplicate inline cid '" + cid + "'");
+                    }
                 }
             }
         }
+    }
+
+    /**
+     * Checks that every {@code cid:} URL in {@link #html} names an inline attachment (PLAN.md §3a). A {@code cid:}
+     * URL is the percent-encoded Content-ID (RFC 2392), so it is decoded before comparing; an undecoded exact match
+     * is accepted too.
+     */
+    private void checkCidReferences(List<String> errors) {
+        if (html == null) return;
+        Set<String> cids = new LinkedHashSet<>();
+        if (attachments != null) {
+            for (Attachment a : attachments) {
+                if (a == null || !a.inline) continue;
+                String cid = a.effectiveCid();
+                if (cid != null && !cid.isBlank()) cids.add(cid.trim());
+            }
+        }
+        Set<String> reported = new LinkedHashSet<>();
+        for (String ref : cidReferences(html)) {
+            String decoded = percentDecode(ref);
+            if (cids.contains(ref) || (decoded != null && cids.contains(decoded))) continue;
+            if (reported.add(ref)) {
+                errors.add("html: cid:" + ref + " does not match any inline attachment");
+            }
+        }
+    }
+
+    /** The Content-IDs referenced by {@code cid:} URLs in an HTML body, as written (not percent-decoded). */
+    public static List<String> cidReferences(String html) {
+        List<String> refs = new ArrayList<>();
+        Matcher m = CID_REFERENCE.matcher(html);
+        while (m.find()) refs.add(m.group(1));
+        return refs;
+    }
+
+    private static boolean isValidCid(String cid) {
+        for (int i = 0; i < cid.length(); i++) {
+            char c = cid.charAt(i);
+            if (c < 0x20 || c == 0x7f || c == '<' || c == '>') return false;
+        }
+        return true;
+    }
+
+    /** Decodes {@code %XX} escapes as UTF-8; {@code null} if the escapes are malformed. */
+    private static String percentDecode(String s) {
+        if (s.indexOf('%') < 0) return s;
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        int i = 0;
+        while (i < s.length()) {
+            if (s.charAt(i) == '%') {
+                if (i + 2 >= s.length()) return null;
+                int hi = Character.digit(s.charAt(i + 1), 16);
+                int lo = Character.digit(s.charAt(i + 2), 16);
+                if (hi < 0 || lo < 0) return null;
+                out.write((hi << 4) | lo);
+                i += 3;
+            } else {
+                int end = s.indexOf('%', i);
+                if (end < 0) end = s.length();
+                out.writeBytes(s.substring(i, end).getBytes(StandardCharsets.UTF_8));
+                i = end;
+            }
+        }
+        return out.toString(StandardCharsets.UTF_8);
     }
 }

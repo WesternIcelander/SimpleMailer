@@ -6,7 +6,10 @@ import com.google.gson.JsonParseException;
 import com.google.gson.JsonParser;
 import io.siggi.http.HTTPRequest;
 import io.siggi.http.HTTPResponder;
+import io.siggi.http.UploadedFile;
 import io.siggi.simplemailer.config.Config;
+import io.siggi.simplemailer.mime.MessagePayload;
+import io.siggi.simplemailer.mime.RawMessage;
 import io.siggi.simplemailer.model.Job;
 import io.siggi.simplemailer.model.JobStatus;
 import io.siggi.simplemailer.model.ModelJson;
@@ -17,11 +20,19 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.function.Consumer;
 
 /**
@@ -36,11 +47,15 @@ import java.util.function.Consumer;
  *     {@code 415} unsupported content type</li>
  * </ul>
  *
- * <p>Only {@code application/json} is accepted here; {@code multipart/form-data} intake arrives with attachment
- * support (PLAN.md §11 step 2).
+ * <p>Two encodings: {@code application/json} (the JSON alone; attachments are base64 {@code content} or {@code url})
+ * and {@code multipart/form-data} (the JSON in a {@code message} field, plus one file part per {@code part}
+ * attachment). Uploaded and base64 attachments are stored under {@code payloads/{uuid}/} during the POST, and for
+ * structured messages without URL attachments the MIME message is built right away.
  */
 public final class MessagesResponder implements HTTPResponder {
     public static final String PATH = "/v1/messages";
+    /** The {@code multipart/form-data} field holding the request JSON. */
+    public static final String MESSAGE_FIELD = "message";
 
     private final Config config;
     private final JobStore store;
@@ -73,21 +88,50 @@ public final class MessagesResponder implements HTTPResponder {
 
     private void handlePost(HTTPRequest request) throws IOException {
         String contentType = request.getHeader("Content-Type");
-        if (contentType == null || !mediaType(contentType).equals("application/json")) {
+        String media = contentType == null ? "" : mediaType(contentType);
+        boolean multipart = media.equals("multipart/form-data");
+        if (!multipart && !media.equals("application/json")) {
             Json.sendError(request, "415 Unsupported Media Type", "unsupported_media_type",
-                    "Content-Type must be application/json");
+                    "Content-Type must be application/json or multipart/form-data");
             return;
         }
 
-        long declared = contentLength(request);
-        if (declared > config.maxMessageBytes) {
-            sendTooLarge(request);
-            return;
-        }
-        byte[] body = readBody(request.getInputStream(), config.maxMessageBytes);
-        if (body == null) {
-            sendTooLarge(request);
-            return;
+        // multipart/form-data was already parsed by SiggiHTTP (bounded by the upload limit, set to maxMessageBytes)
+        Map<String, Path> uploads = new HashMap<>();
+        Map<String, UploadedFile> uploadInfo = new HashMap<>();
+        byte[] body;
+        if (multipart) {
+            String field = request.post().get(MESSAGE_FIELD);
+            UploadedFile messageFile = request.uploadedFiles().get(MESSAGE_FIELD);
+            if (field != null) {
+                body = field.getBytes(StandardCharsets.UTF_8);
+            } else if (messageFile != null) {
+                if (messageFile.file.length() > config.maxMessageBytes) {
+                    sendTooLarge(request);
+                    return;
+                }
+                body = Files.readAllBytes(messageFile.file.toPath());
+            } else {
+                Json.sendValidationErrors(request,
+                        List.of("multipart/form-data requests need a '" + MESSAGE_FIELD + "' field with the JSON"));
+                return;
+            }
+            for (Map.Entry<String, UploadedFile> e : request.uploadedFiles().entrySet()) {
+                if (e.getKey().equals(MESSAGE_FIELD)) continue;
+                uploads.put(e.getKey(), e.getValue().file.toPath());
+                uploadInfo.put(e.getKey(), e.getValue());
+            }
+        } else {
+            long declared = contentLength(request);
+            if (declared > config.maxMessageBytes) {
+                sendTooLarge(request);
+                return;
+            }
+            body = readBody(request.getInputStream(), config.maxMessageBytes);
+            if (body == null) {
+                sendTooLarge(request);
+                return;
+            }
         }
         if (body.length == 0) {
             Json.sendValidationErrors(request, List.of("request body is required"));
@@ -107,18 +151,45 @@ public final class MessagesResponder implements HTTPResponder {
             return;
         }
 
+        if (multipart) applyUploadDefaults(send, uploadInfo);
         List<String> errors = new ArrayList<>(send.validate());
-        errors.addAll(validateJsonAttachments(send));
+        Map<Integer, byte[]> decoded = new HashMap<>();
+        errors.addAll(validateAttachments(send, multipart, uploads, decoded));
         if (!errors.isEmpty()) {
             Json.sendValidationErrors(request, errors);
             return;
         }
+        String tooLarge = oversizeAttachment(send, uploads, decoded);
+        if (tooLarge != null) {
+            Json.sendError(request, "413 Payload Too Large", "too_large", tooLarge);
+            return;
+        }
 
         send.id = send.id.toLowerCase(Locale.ROOT);
-        String hash = JobStore.payloadHash(send);
-        JobStatus initial = hasUrlAttachments(send) ? JobStatus.PREPARING : JobStatus.QUEUED;
-        JobStore.CreateResult result = store.create(send.id, hash,
-                () -> Job.create(send, hash, Instant.now(), initial));
+        Map<String, String> fileHashes = new TreeMap<>();
+        for (String part : referencedParts(send)) {
+            fileHashes.put(part, JobStore.sha256Hex(uploads.get(part)));
+        }
+        String hash = JobStore.payloadHash(send, fileHashes);
+        boolean fetchLater = hasUrlAttachments(send);
+        JobStatus initial = fetchLater ? JobStatus.PREPARING : JobStatus.QUEUED;
+        JobStore.CreateResult result = store.create(send.id, hash, () -> {
+            if (send.isRaw()) {
+                // raw messages are stored as-is, apart from CRLF normalisation (PLAN.md §3a)
+                store.writePayload(send.id, RawMessage.normalise(send.raw));
+            } else {
+                // uploaded and base64 attachments go to payloads/{uuid}/; URL attachments are fetched later and
+                // the message is built then (PLAN.md §3a)
+                try {
+                    MessagePayload.storeAttachments(store, send, uploads, decoded);
+                    if (!fetchLater) MessagePayload.buildMessage(store, send, config.heloName);
+                } catch (IOException | RuntimeException e) {
+                    MessagePayload.deleteAttachments(store, send.id);
+                    throw e;
+                }
+            }
+            return Job.create(MessagePayload.forJobFile(send), hash, Instant.now(), initial);
+        });
         Job job = result.job();
         String statusUrl = statusUrl(config, job.id);
 
@@ -147,25 +218,56 @@ public final class MessagesResponder implements HTTPResponder {
     }
 
     /**
-     * Attachment rules that only apply to JSON requests: no {@code part} sources (those need
-     * {@code multipart/form-data}), {@code content} must be base64, and {@code url} must be https (or http when
-     * {@code allowHttpAttachmentUrls}).
+     * For {@code part} attachments, the uploaded file's name and content type stand in for a missing
+     * {@code filename} / {@code contentType}. Applied before hashing, so they count towards the payload.
      */
-    private List<String> validateJsonAttachments(SendRequest send) {
+    private static void applyUploadDefaults(SendRequest send, Map<String, UploadedFile> uploads) {
+        if (send.isRaw() || send.attachments == null) return;
+        for (SendRequest.Attachment a : send.attachments) {
+            if (a == null || a.part == null) continue;
+            UploadedFile f = uploads.get(a.part);
+            if (f == null) continue;
+            if ((a.filename == null || a.filename.isBlank()) && f.filename != null && !f.filename.isBlank()) {
+                a.filename = f.filename;
+            }
+            if ((a.contentType == null || a.contentType.isBlank()) && f.contentType != null
+                    && !f.contentType.isBlank()) {
+                a.contentType = f.contentType.trim();
+            }
+        }
+    }
+
+    /**
+     * Attachment source rules: {@code part} needs a {@code multipart/form-data} request and an uploaded file of that
+     * name, and every uploaded file must be used; {@code content} must be base64 (decoded into {@code decoded} by
+     * attachment index); {@code url} must be https (or http when {@code allowHttpAttachmentUrls}).
+     */
+    private List<String> validateAttachments(SendRequest send, boolean multipart, Map<String, Path> uploads,
+                                             Map<Integer, byte[]> decoded) {
         List<String> errors = new ArrayList<>();
-        if (send.isRaw() || send.attachments == null) return errors;
-        for (int i = 0; i < send.attachments.size(); i++) {
+        if (send.isRaw()) {
+            if (!uploads.isEmpty()) errors.add("file parts are not used with raw");
+            return errors;
+        }
+        Set<String> used = new HashSet<>();
+        for (int i = 0; send.attachments != null && i < send.attachments.size(); i++) {
             SendRequest.Attachment a = send.attachments.get(i);
             if (a == null) continue;
             String where = "attachments[" + i + "]";
             if (a.part != null) {
-                errors.add(where + ": part attachments require a multipart/form-data request");
+                if (!multipart) {
+                    errors.add(where + ": part attachments require a multipart/form-data request");
+                } else if (!uploads.containsKey(a.part)) {
+                    errors.add(where + ": no file part named '" + a.part + "'");
+                } else {
+                    used.add(a.part);
+                }
             }
             if (a.content != null) {
                 try {
                     // The MIME decoder silently skips non-alphabet characters, so strip whitespace (line breaks)
                     // ourselves and use the strict decoder.
-                    Base64.getDecoder().decode(a.content.replaceAll("\\s+", ""));
+                    decoded.put(i, Base64.getDecoder().decode(a.content.replaceAll("\\s+", "")));
                 } catch (IllegalArgumentException e) {
                     errors.add(where + ": content is not valid base64");
                 }
@@ -180,7 +282,35 @@ public final class MessagesResponder implements HTTPResponder {
                 }
             }
         }
+        for (String name : new TreeSet<>(uploads.keySet())) {
+            if (!used.contains(name)) errors.add("file part '" + name + "' is not used by any attachment");
+        }
         return errors;
+    }
+
+    /** An error message if an uploaded or base64 attachment is larger than {@code maxAttachmentBytes}, else null. */
+    private String oversizeAttachment(SendRequest send, Map<String, Path> uploads, Map<Integer, byte[]> decoded)
+            throws IOException {
+        if (send.isRaw() || send.attachments == null) return null;
+        for (int i = 0; i < send.attachments.size(); i++) {
+            SendRequest.Attachment a = send.attachments.get(i);
+            if (a == null) continue;
+            long size = a.part != null ? Files.size(uploads.get(a.part))
+                    : a.content != null ? decoded.get(i).length : 0;
+            if (size > config.maxAttachmentBytes) {
+                return "attachments[" + i + "] exceeds " + config.maxAttachmentBytes + " bytes";
+            }
+        }
+        return null;
+    }
+
+    private static Set<String> referencedParts(SendRequest send) {
+        Set<String> parts = new TreeSet<>();
+        if (send.isRaw() || send.attachments == null) return parts;
+        for (SendRequest.Attachment a : send.attachments) {
+            if (a != null && a.part != null) parts.add(a.part);
+        }
+        return parts;
     }
 
     private static boolean hasUrlAttachments(SendRequest send) {

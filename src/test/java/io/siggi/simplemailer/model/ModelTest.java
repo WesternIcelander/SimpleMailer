@@ -174,4 +174,57 @@ class ModelTest {
         assertTrue(job.recipients.stream().allMatch(r -> r.status == FAILED
                 && "ATTACHMENT_FETCH_FAILED".equals(r.error)));
     }
+
+    private static SendRequest.Attachment inline(String filename, String cid) {
+        SendRequest.Attachment a = new SendRequest.Attachment();
+        a.content = "AAAA";
+        a.filename = filename;
+        a.inline = true;
+        a.cid = cid;
+        return a;
+    }
+
+    @Test
+    void cidReferencesAreFoundInAttributesAndCss() {
+        assertEquals(List.of("a.png", "b", "c%20d", "e"), SendRequest.cidReferences(
+                "<img src=\"cid:a.png\"><img SRC='CID:b'><td background=cid:c%20d>"
+                        + "<div style=\"background:url( 'cid:e' )\">mention of cid:x in text</div>"));
+    }
+
+    @Test
+    void cidReferencesMatchingInlineAttachmentsAreValid() {
+        SendRequest r = structured();
+        r.html = "<img src=\"cid:logo.png\"><img src=\"cid:my%20sig\"><img src=\"cid:logo.png\">";
+        r.attachments = List.of(inline("logo.png", null), inline("sig.png", "my sig"));
+        assertEquals(List.of(), r.validate());
+    }
+
+    @Test
+    void unmatchedCidIsRejected() {
+        SendRequest r = structured();
+        r.html = "<img src=\"cid:logo.png\"><img src=\"cid:missing\"><img src=\"cid:missing\">";
+        SendRequest.Attachment notInline = inline("other.png", null);
+        notInline.inline = false;
+        r.attachments = List.of(inline("logo.png", null), notInline);
+        List<String> errors = r.validate();
+        assertEquals(1, errors.size(), errors.toString());
+        assertTrue(errors.get(0).contains("cid:missing"), errors.toString());
+
+        // A regular (non-inline) attachment does not satisfy a cid: reference.
+        r.html = "<img src=\"cid:other.png\">";
+        assertTrue(r.validate().stream().anyMatch(e -> e.contains("cid:other.png")));
+
+        // No attachments at all.
+        r.attachments = null;
+        assertTrue(r.validate().stream().anyMatch(e -> e.contains("cid:other.png")));
+    }
+
+    @Test
+    void invalidAndDuplicateCidsAreRejected() {
+        SendRequest r = structured();
+        r.attachments = List.of(inline("a.png", "x>y"));
+        assertTrue(r.validate().stream().anyMatch(e -> e.contains("must not contain")));
+        r.attachments = List.of(inline("a.png", "same"), inline("b.png", "same"));
+        assertTrue(r.validate().stream().anyMatch(e -> e.contains("duplicate inline cid")));
+    }
 }

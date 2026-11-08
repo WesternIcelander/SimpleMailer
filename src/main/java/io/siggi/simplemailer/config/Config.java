@@ -51,6 +51,8 @@ public final class Config {
     public List<String> attachmentUrlAllowlist = new ArrayList<>();
     public long maxAttachmentBytes = 25L * 1024 * 1024;
     public boolean allowHttpAttachmentUrls = false;
+    /** Overall time limit for fetching one URL attachment, redirects included. */
+    public Duration attachmentFetchTimeout = Duration.ofSeconds(60);
 
     public Bounces bounces = new Bounces();
 
@@ -192,6 +194,7 @@ public final class Config {
         if (maxConcurrentDeliveries <= 0) errors.add("maxConcurrentDeliveries must be positive");
         requirePositive(errors, "connectTimeout", connectTimeout);
         requirePositive(errors, "readTimeout", readTimeout);
+        requirePositive(errors, "attachmentFetchTimeout", attachmentFetchTimeout);
         requirePositive(errors, "maxRetryDuration", maxRetryDuration);
         if (jobRetention != null && (jobRetention.isZero() || jobRetention.isNegative())) {
             errors.add("jobRetention must be positive (or omitted to keep forever)");
