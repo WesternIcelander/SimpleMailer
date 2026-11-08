@@ -6,6 +6,7 @@ import io.siggi.http.HTTPServerBuilder;
 import io.siggi.simplemailer.api.Auth;
 import io.siggi.simplemailer.api.MessagesResponder;
 import io.siggi.simplemailer.api.StatusResponder;
+import io.siggi.simplemailer.callback.CallbackDispatcher;
 import io.siggi.simplemailer.config.Config;
 import io.siggi.simplemailer.delivery.DeliveryEngine;
 import io.siggi.simplemailer.delivery.RetryScheduler;
@@ -43,6 +44,7 @@ public final class Main implements AutoCloseable {
     private final JobPreparer preparer;
     private final DeliveryEngine deliveryEngine;
     private final RetryScheduler retryScheduler;
+    private final CallbackDispatcher callbackDispatcher;
 
     private Main(Config config, ServerSocket serverSocket) throws IOException {
         this.config = config;
@@ -50,17 +52,19 @@ public final class Main implements AutoCloseable {
         this.executor = Executors.newVirtualThreadPerTaskExecutor();
         this.auth = Auth.fromConfig(config);
         this.store = new JobStore(Path.of(config.dataDir));
+        this.callbackDispatcher = new CallbackDispatcher(config, store, executor);
         // deferred recipients are re-run by the retry scheduler at their nextAttemptAt
         this.retryScheduler = new RetryScheduler(config, this::submitRetry);
         DeliveryEngine.Options deliveryOptions = new DeliveryEngine.Options();
         deliveryOptions.retryPolicy = retryScheduler;
-        deliveryOptions.onRunFinished = retryScheduler::onRunFinished;
+        deliveryOptions.onRunFinished = job -> {
+            retryScheduler.onRunFinished(job);
+            callbackDispatcher.onJobChanged(job);
+        };
         this.deliveryEngine = new DeliveryEngine(config, store, MxResolver.system(), executor, deliveryOptions);
         this.deliveryQueue = deliveryEngine::submit;
         this.preparer = new JobPreparer(config, store, AttachmentFetcher.fromConfig(config), executor,
-                this::enqueue, job -> {
-                    // the callback dispatcher (a later step) will report ATTACHMENT_FETCH_FAILED here
-                });
+                this::enqueue, callbackDispatcher::onJobChanged);
 
         Path tmpDir = Path.of(config.dataDir, "tmp");
         Files.createDirectories(tmpDir);
@@ -107,6 +111,7 @@ public final class Main implements AutoCloseable {
         main.listen();
         main.executor.execute(main::resumePreparing);
         main.executor.execute(main::resumeDelivery);
+        main.executor.execute(main::resumeCallbacks);
         return main;
     }
 
@@ -173,6 +178,10 @@ public final class Main implements AutoCloseable {
         return retryScheduler;
     }
 
+    public CallbackDispatcher callbackDispatcher() {
+        return callbackDispatcher;
+    }
+
     public JobPreparer preparer() {
         return preparer;
     }
@@ -213,6 +222,15 @@ public final class Main implements AutoCloseable {
         }
     }
 
+    /** Startup: callback events left pending by a restart are retried at their scheduled time. */
+    private void resumeCallbacks() {
+        try {
+            callbackDispatcher.resumeAll();
+        } catch (IOException e) {
+            System.err.println("Could not resume pending callbacks: " + e);
+        }
+    }
+
     /** {@code GET /health}: unauthenticated liveness check. */
     private static void health(HTTPRequest request) throws Exception {
         if (!request.method.equals("GET")) {
@@ -239,6 +257,7 @@ public final class Main implements AutoCloseable {
             serverSocket.close();
         } finally {
             retryScheduler.close();
+            callbackDispatcher.close();
             executor.shutdownNow();
         }
     }

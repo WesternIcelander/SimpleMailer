@@ -68,6 +68,18 @@ public final class Config {
     /** {@code null} means records are kept forever. */
     public Duration jobRetention = null;
     public String callbackSecret = null;
+    /** Backoff between callback attempts; the last entry repeats (PLAN.md §6). */
+    public List<Duration> callbackRetrySchedule = new ArrayList<>(List.of(
+            Duration.ofSeconds(10), Duration.ofMinutes(1), Duration.ofMinutes(5), Duration.ofMinutes(15),
+            Duration.ofHours(1), Duration.ofHours(2)));
+    /** A callback event that still fails this long after it was created is given up. */
+    public Duration callbackMaxRetryDuration = Duration.ofHours(24);
+    /** Connect and response timeout for one callback POST. */
+    public Duration callbackTimeout = Duration.ofSeconds(30);
+    /**
+     * SSRF guard for callback URLs: when true, a callback whose host resolves to a loopback, private, link-local or
+     * other non-public address is refused (the event is given up, nothing is sent).
+     */
     public boolean blockPrivateCallbackTargets = false;
     public Map<String, DkimKey> dkim = new LinkedHashMap<>();
     public List<String> trustedProxies = new ArrayList<>();
@@ -171,6 +183,7 @@ public final class Config {
         if (bounces.intake == null) bounces.intake = new ArrayList<>();
         if (bounces.apiKeys == null) bounces.apiKeys = new ArrayList<>();
         if (retrySchedule == null) retrySchedule = new ArrayList<>();
+        if (callbackRetrySchedule == null) callbackRetrySchedule = new ArrayList<>();
         if (dkim == null) dkim = new LinkedHashMap<>();
         if (trustedProxies == null) trustedProxies = new ArrayList<>();
         bounces.intake.replaceAll(s -> s.trim().toLowerCase(Locale.ROOT));
@@ -196,11 +209,16 @@ public final class Config {
         requirePositive(errors, "readTimeout", readTimeout);
         requirePositive(errors, "attachmentFetchTimeout", attachmentFetchTimeout);
         requirePositive(errors, "maxRetryDuration", maxRetryDuration);
+        requirePositive(errors, "callbackMaxRetryDuration", callbackMaxRetryDuration);
+        requirePositive(errors, "callbackTimeout", callbackTimeout);
         if (jobRetention != null && (jobRetention.isZero() || jobRetention.isNegative())) {
             errors.add("jobRetention must be positive (or omitted to keep forever)");
         }
         for (Duration d : retrySchedule) {
             if (d == null || d.isZero() || d.isNegative()) errors.add("retrySchedule entries must be positive");
+        }
+        for (Duration d : callbackRetrySchedule) {
+            if (d == null || d.isZero() || d.isNegative()) errors.add("callbackRetrySchedule entries must be positive");
         }
         if (apiKeys.stream().anyMatch(Config::isBlank)) errors.add("apiKeys must not contain blank keys");
         for (String intake : bounces.intake) {

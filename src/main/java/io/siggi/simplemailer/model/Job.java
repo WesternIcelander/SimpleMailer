@@ -42,6 +42,8 @@ public final class Job {
         public String lastError;
         /** Set once the first {@code deferred} event was sent, so it isn't sent again. */
         public boolean deferredNotified;
+        /** Set once the terminal delivery event ({@code delivered}/{@code partially_failed}/{@code failed}) was sent. */
+        public boolean terminalNotified;
     }
 
     /** Summary of one received bounce (PLAN.md §6a). */
